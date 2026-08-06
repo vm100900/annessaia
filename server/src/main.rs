@@ -1344,6 +1344,62 @@ async fn api_peer_remove(State(st): State<St>, body: Bytes) -> String {
 fn ok(msg: impl Into<String>)  -> String { format!("ok\t{}",  msg.into()) }
 fn err(msg: impl Into<String>) -> String { format!("err\t{}", msg.into()) }
 
+// ── Admin auth ────────────────────────────────────────────────────────────────
+//
+// See docs/superpowers/specs/2026-08-05-server-admin-auth-design.md. All
+// three endpoints below stay at HTTP 200 on every path, same reasoning as
+// ok()/err() just above: the WASM host's fetch treats non-2xx as a transport
+// error and throws the body away.
+
+// GET /api/admin/status — "1" if an admin password has been set, else "0".
+// Unauthenticated on purpose: it's how admin.wasm decides whether to show
+// the setup screen or the login screen.
+async fn api_admin_status(State(st): State<St>) -> String {
+    let data_dir = st.registry.lock().unwrap().data_dir.clone();
+    if admin_pass_path(&data_dir).exists() { "1".into() } else { "0".into() }
+}
+
+// POST /api/admin/setup — body: the chosen admin password. One-time only:
+// fails once admin_pass.hash exists on disk. There is no reset endpoint —
+// a forgotten password is recovered by deleting that file by hand.
+async fn api_admin_setup(State(st): State<St>, body: Bytes) -> String {
+    let password = String::from_utf8_lossy(&body).trim().to_string();
+    if password.len() < 8 { return err("password must be at least 8 characters"); }
+
+    let data_dir = st.registry.lock().unwrap().data_dir.clone();
+    let path = admin_pass_path(&data_dir);
+    if path.exists() { return err("an admin password is already set"); }
+
+    let hash = match bcrypt::hash(&password, bcrypt::DEFAULT_COST) {
+        Ok(h) => h,
+        Err(_) => return err("could not hash password"),
+    };
+    if fs::write(&path, &hash).is_err() { return err("could not save password"); }
+
+    let token = random_hex(32);
+    st.admin_sessions.lock().unwrap().insert(token.clone());
+    ok(token)
+}
+
+// POST /api/admin/login — body: password. Returns a fresh session token on
+// success — logging in twice from two tabs yields two independent tokens,
+// both valid until the server restarts.
+async fn api_admin_login(State(st): State<St>, body: Bytes) -> String {
+    let password = String::from_utf8_lossy(&body).trim().to_string();
+    let data_dir = st.registry.lock().unwrap().data_dir.clone();
+    let Ok(hash) = fs::read_to_string(admin_pass_path(&data_dir)) else {
+        return err("no admin password set yet");
+    };
+    match bcrypt::verify(&password, hash.trim()) {
+        Ok(true) => {
+            let token = random_hex(32);
+            st.admin_sessions.lock().unwrap().insert(token.clone());
+            ok(token)
+        }
+        _ => err("wrong password"),
+    }
+}
+
 // GET /api/directory — status line: <directory url>\t<published>\t<self url>
 async fn api_directory(State(st): State<St>) -> String {
     let r = st.registry.lock().unwrap();
@@ -1493,6 +1549,47 @@ async fn heartbeat(state: St) {
     }
 }
 
+// Every route this node serves. A plain function (not inlined in `main`) so
+// tests can build the exact same router against a throwaway AppState instead
+// of a partial hand-rolled copy that could drift from what actually runs.
+//
+// Tasks 4 and 5 will move some of these routes into an auth-gated group and
+// add the AI-toggle route; for now this is a straight lift of the router
+// `main` already built, unchanged in behavior.
+fn build_router(state: St, data_dir: &Path) -> Router {
+    Router::new()
+        .route("/",                  get(serve_index))
+        .route("/admin",             get(serve_admin))
+        .route("/ws",                get(ws_endpoint))
+        .route("/api/apps",          get(api_apps))
+        .route("/api/search",        get(api_search))
+        .route("/api/search/debug",  get(api_search_debug))
+        .route("/api/submit",        post(api_submit))
+        .route("/api/upload",        post(api_upload))
+        .route("/api/mine",          get(api_mine))
+        .route("/api/stats",         get(api_stats))
+        .route("/api/reviews",       get(api_reviews))
+        .route("/api/rate",          post(api_rate))
+        .route("/api/open",          post(api_open))
+        .route("/api/peers",         get(api_peers))
+        .route("/api/peers/active",  get(api_active_peers))
+        .route("/api/revoke",        post(api_revoke))
+        .route("/api/peer/connect",  post(api_peer_connect))
+        .route("/api/peer/remove",   post(api_peer_remove))
+        .route("/api/directory",              get(api_directory))
+        .route("/api/directory/publish",     post(api_directory_publish))
+        .route("/api/directory/unpublish",   post(api_directory_unpublish))
+        .route("/api/directory/refresh",     post(api_directory_refresh))
+        .route("/api/admin/status",  get(api_admin_status))
+        .route("/api/admin/setup",   post(api_admin_setup))
+        .route("/api/admin/login",   post(api_admin_login))
+        // Apps uploaded through /api/upload, served straight back out.
+        .nest_service("/apps", ServeDir::new(data_dir.join("apps")))
+        .fallback_service(ServeDir::new("dist"))
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        .with_state(state)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1593,34 +1690,7 @@ async fn main() {
     bootstrap(Arc::clone(&state)).await;
     tokio::spawn(heartbeat(Arc::clone(&state)));
 
-    let app = Router::new()
-        .route("/",                  get(serve_index))
-        .route("/admin",             get(serve_admin))
-        .route("/ws",                get(ws_endpoint))
-        .route("/api/apps",          get(api_apps))
-        .route("/api/search",        get(api_search))
-        .route("/api/search/debug",  get(api_search_debug))
-        .route("/api/submit",        post(api_submit))
-        .route("/api/upload",        post(api_upload))
-        .route("/api/mine",          get(api_mine))
-        .route("/api/stats",         get(api_stats))
-        .route("/api/reviews",       get(api_reviews))
-        .route("/api/rate",          post(api_rate))
-        .route("/api/open",          post(api_open))
-        .route("/api/peers",         get(api_peers))
-        .route("/api/peers/active",  get(api_active_peers))
-        .route("/api/revoke",        post(api_revoke))
-        .route("/api/peer/connect",  post(api_peer_connect))
-        .route("/api/peer/remove",   post(api_peer_remove))
-        .route("/api/directory",              get(api_directory))
-        .route("/api/directory/publish",     post(api_directory_publish))
-        .route("/api/directory/unpublish",   post(api_directory_unpublish))
-        .route("/api/directory/refresh",     post(api_directory_refresh))
-        // Apps uploaded through /api/upload, served straight back out.
-        .nest_service("/apps", ServeDir::new(data_dir.join("apps")))
-        .fallback_service(ServeDir::new("dist"))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        .with_state(state);
+    let app = build_router(state, &data_dir);
 
     println!();
     println!("  Open these in annessaia (cargo run -p annessaia --release):");
@@ -1655,5 +1725,79 @@ mod tests {
         let a = random_hex(32);
         let b = random_hex(32);
         assert_ne!(a, b);
+    }
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    // Builds a fully-wired AppState against a fresh temp data_dir, with no
+    // embedder (matches a node's own graceful "model unavailable" startup
+    // path — no network access or 1.3GB download needed to run these tests).
+    // The TempDir must be kept alive for as long as the state is used, or the
+    // directory is deleted out from under it.
+    fn test_state() -> (St, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut embedder: Option<Embedder> = None;
+        let registry = Registry::load(dir.path().to_path_buf(), "http://localhost:9999".into(), &mut embedder);
+        let (connect_tx, _connect_rx) = mpsc::unbounded_channel::<String>();
+        let state: St = Arc::new(AppState {
+            registry: Mutex::new(registry),
+            conns: Mutex::new(HashMap::new()),
+            connect_tx,
+            embedder: Mutex::new(embedder),
+            admin_sessions: Mutex::new(HashSet::new()),
+            ai_enabled: AtomicBool::new(true),
+        });
+        (state, dir)
+    }
+
+    async fn body_str(resp: axum::response::Response) -> String {
+        String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_is_unset_then_set_after_setup() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+
+        let resp = app.clone().oneshot(Request::get("/api/admin/status").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "0");
+
+        let resp = app.clone().oneshot(Request::post("/api/admin/setup").body(Body::from("hunter2pass")).unwrap()).await.unwrap();
+        assert!(body_str(resp).await.starts_with("ok\t"));
+
+        let resp = app.oneshot(Request::get("/api/admin/status").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "1");
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_short_passwords() {
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+        let resp = app.oneshot(Request::post("/api/admin/setup").body(Body::from("short")).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "err\tpassword must be at least 8 characters");
+    }
+
+    #[tokio::test]
+    async fn setup_is_rejected_once_a_password_already_exists() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+        app.clone().oneshot(Request::post("/api/admin/setup").body(Body::from("firstpassword")).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::post("/api/admin/setup").body(Body::from("secondpassword")).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "err\tan admin password is already set");
+    }
+
+    #[tokio::test]
+    async fn login_succeeds_with_the_right_password_and_fails_with_the_wrong_one() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+        app.clone().oneshot(Request::post("/api/admin/setup").body(Body::from("hunter2pass")).unwrap()).await.unwrap();
+
+        let resp = app.clone().oneshot(Request::post("/api/admin/login").body(Body::from("hunter2pass")).unwrap()).await.unwrap();
+        assert!(body_str(resp).await.starts_with("ok\t"));
+
+        let resp = app.oneshot(Request::post("/api/admin/login").body(Body::from("wrong")).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "err\twrong password");
     }
 }

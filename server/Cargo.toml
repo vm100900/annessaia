@@ -18,6 +18,14 @@ rand = "0.8"
 # with --no-default-features for a lean, keyword-only-search node.
 fastembed = { version = "5", optional = true }
 base64 = "0.22"
+# Password hashing for the admin panel — a single-operator local credential,
+# not a multi-tenant store, so bcrypt's small API (hash/verify) is enough;
+# no need for argon2's extra configurability.
+bcrypt = "0.15"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+tempfile = "3"
 
 [features]
 default = ["ai"]
