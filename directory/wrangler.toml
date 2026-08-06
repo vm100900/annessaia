@@ -1,0 +1,42 @@
+name = "bootstrap"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# Create with:  npx wrangler kv namespace create PEERS
+# Local `wrangler dev` simulates KV, so a placeholder id is fine until you deploy.
+[[kv_namespaces]]
+binding = "PEERS"
+id = "86f5787cb76f44dea1dc0a7fc8e7094b"
+
+# The .wasm apps. Populated by ./build-apps.sh — do not edit public/ by hand.
+# Assets matching a request are served directly; everything else falls through
+# to the Worker, which handles /peers, /register and the /api/* registry.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Our own public address. The liveness probe needs it because a Worker cannot
+# fetch its own hostname — such a request returns 404 instead of reaching the
+# asset binding, which would mark every self-hosted app dead. Keep in sync if
+# the Worker is ever renamed.
+[vars]
+SELF_URL = "https://bootstrap.annessaia.workers.dev"
+
+# The gossip hub. One instance holds every peer connection, so all nodes share a
+# view. SQLite-backed because that is the only kind available on the free plan.
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]
+
+# Liveness sweep: probe listed apps and drop any that has been unreachable for
+# more than an hour.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# ALLOW_LOCAL permits registering localhost peers. Never set it on the deployed
+# Worker — pass it only for local testing:
+#   npx wrangler dev --var ALLOW_LOCAL:1

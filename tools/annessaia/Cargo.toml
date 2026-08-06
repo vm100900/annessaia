@@ -1,0 +1,20 @@
+[package]
+name = "annessaia-cli"
+version = "0.1.0"
+edition = "2021"
+description = "annessaia project CLI — create and manage annessaia WASM apps"
+
+[[bin]]
+name = "annessaia"
+path = "src/main.rs"
+
+[dependencies]
+# Only ever writes Stored (uncompressed) entries when bundling a
+# .wasmpackage — assets are typically already-compressed formats (PNG, JPEG,
+# MP3...) with little left to gain from a second compression pass, so no
+# codec feature is needed at all.
+zip = { version = "8", default-features = false }
+# Hashes the final output so it can be named <stem>.<hash>.wasmh — must match
+# annessaia's own sha256_hex exactly (full hex digest, no truncation) so a
+# .wasmh URL's embedded hash lines up with the host's cache key.
+sha2 = "0.11"

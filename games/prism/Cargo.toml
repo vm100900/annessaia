@@ -1,0 +1,18 @@
+[package]
+name = "prism"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace root: this game lives inside the annessaia repo but is not a
+# member of it, so it never gets picked up by build.sh or the Worker deploy.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+annessaia-sdk = { path = "../../sdk" }
+
+[profile.release]
+opt-level = "z"
+lto = true

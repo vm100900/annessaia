@@ -1,0 +1,41 @@
+[package]
+name = "annessaia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+wasmtime = "27"
+anyhow = "1.0"
+rfd = "0.14"
+ureq = "2.9"
+arboard = "3"
+# Optional: pulls in a ~1.3GB model download on first use. On by default so
+# `cargo build` behaves the same as before this was a feature at all — build
+# with --no-default-features for a lean host with no on-device query embedding
+# (search then falls back to whatever the registry can do with keywords alone).
+fastembed = { version = "5", optional = true }
+base64 = "0.22"
+# Pinned to the 0.21 line deliberately: 0.22 (Feb 2026) redesigned the whole
+# output/sink API (DeviceSinkBuilder/Player/Mixer replacing OutputStream/Sink),
+# and landed after this session's knowledge cutoff — the classic API here is
+# the one actually well-understood, not a guess from inconsistent doc fetches.
+rodio = "0.21"
+# PNG/JPEG decoding for the image API (decode happens host-side; the guest
+# just hands over file bytes, same pattern as sound). Default features cover
+# both formats plus several others (gif, bmp, webp, ...) for free.
+image = "0.25"
+# .wasmpackage reading (a zip of app.wasm + assets/) and hashing the archive
+# to key the on-disk extraction cache. Pinned to the 8.x stable line — 9.x is
+# still a pre-release at the time this was added. Default features drag in
+# bzip2/lzma/ppmd/AES/zstd/zopfli — codecs we'll never see (annessaia-cli only
+# ever writes Stored, i.e. uncompressed, entries) — trimmed to just enough to
+# read an ordinary deflate-compressed zip, the only other case worth handling
+# (a package built by some other zip tool).
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+sha2 = "0.11"
+
+[features]
+default = ["ai"]
+ai = ["dep:fastembed"]

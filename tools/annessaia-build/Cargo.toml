@@ -1,0 +1,8 @@
+[package]
+name = "annessaia-build"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "annessaia-build"
+path = "src/main.rs"

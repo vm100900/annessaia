@@ -1,0 +1,3 @@
+[workspace]
+members = ["annessaia", "apps/keys", "apps/calculator", "apps/paint", "apps/gpu", "apps/pixel", "apps/widgets", "apps/search", "apps/admin", "apps/nova", "server", "tools/annessaia", "sdk"]
+resolver = "2"

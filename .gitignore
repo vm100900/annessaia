@@ -1,0 +1,7 @@
+target
+/dist
+data
+.fastembed_cache
+.DS_Store
+node_modules
+.wrangler

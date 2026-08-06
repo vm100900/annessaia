@@ -1,0 +1,15 @@
+[package]
+name = "testing"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+annessaia-sdk = { path = "/Users/virenvijaymane/.annessaia/sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
