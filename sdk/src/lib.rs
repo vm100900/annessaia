@@ -1340,7 +1340,7 @@ pub mod prelude {
         heading, label, small, colored, code,
         button, button_styled, button_danger, button_success, button_ghost,
         checkbox, slider,
-        progress, progress_bar, text_field,
+        progress, progress_bar, text_field, text_field_secret,
         text, badge,
         row, card, card_color, columns2, columns3, columns4,
         space, separator,
