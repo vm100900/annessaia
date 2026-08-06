@@ -407,6 +407,7 @@ fn doc_semantic_score(query_vec: Option<&[i8]>, app: &App) -> f32 {
 /// than needing its own #[cfg] at every use.
 #[cfg(feature = "ai")]
 async fn embed_text(st: &St, text: String) -> Option<Vec<f32>> {
+    if !st.ai_enabled.load(Ordering::Relaxed) { return None; }
     let st = Arc::clone(st);
     tokio::task::spawn_blocking(move || {
         let mut guard = st.embedder.lock().unwrap();
@@ -1401,6 +1402,26 @@ async fn api_admin_login(State(st): State<St>, body: Bytes) -> String {
     }
 }
 
+// GET /api/admin/ai (auth-gated) — current AI-enabled state, "1" or "0".
+async fn api_admin_ai_get(State(st): State<St>) -> String {
+    if st.ai_enabled.load(Ordering::Relaxed) { "1".into() } else { "0".into() }
+}
+
+// POST /api/admin/ai (auth-gated) — body "1" or "0". Applies to every user
+// of this node immediately: embed_text checks this flag before it does
+// anything else.
+async fn api_admin_ai_set(State(st): State<St>, body: Bytes) -> String {
+    let enabled = match String::from_utf8_lossy(&body).trim() {
+        "1" => true,
+        "0" => false,
+        _ => return err("expected \"1\" or \"0\""),
+    };
+    st.ai_enabled.store(enabled, Ordering::Relaxed);
+    let data_dir = st.registry.lock().unwrap().data_dir.clone();
+    let _ = fs::write(ai_enabled_path(&data_dir), if enabled { "1" } else { "0" });
+    ok(if enabled { "AI enabled" } else { "AI disabled" })
+}
+
 // GET /api/directory — status line: <directory url>\t<published>\t<self url>
 async fn api_directory(State(st): State<St>) -> String {
     let r = st.registry.lock().unwrap();
@@ -1589,6 +1610,7 @@ fn build_router(state: St, data_dir: &Path) -> Router {
         .route("/api/directory/publish",     post(api_directory_publish))
         .route("/api/directory/unpublish",   post(api_directory_unpublish))
         .route("/api/directory/refresh",     post(api_directory_refresh))
+        .route("/api/admin/ai", get(api_admin_ai_get).post(api_admin_ai_set))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -1863,5 +1885,42 @@ mod tests {
         let resp = app.oneshot(Request::get("/api/apps").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_ne!(body_str(resp).await, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn ai_toggle_defaults_on_and_persists_the_chosen_state() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+
+        let resp = app.clone().oneshot(Request::post("/api/admin/setup").body(Body::from("hunter2pass")).unwrap()).await.unwrap();
+        let token = body_str(resp).await.strip_prefix("ok\t").unwrap().to_string();
+
+        let resp = app.clone().oneshot(Request::get(&format!("/api/admin/ai?token={token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "1");
+
+        let resp = app.clone().oneshot(Request::post(&format!("/api/admin/ai?token={token}")).body(Body::from("0")).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "ok\tAI disabled");
+
+        assert!(!state.ai_enabled.load(Ordering::Relaxed));
+        assert_eq!(fs::read_to_string(dir.path().join("ai_enabled")).unwrap().trim(), "0");
+
+        let resp = app.oneshot(Request::get(&format!("/api/admin/ai?token={token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "0");
+    }
+
+    #[tokio::test]
+    async fn ai_toggle_requires_a_session() {
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+        let resp = app.oneshot(Request::get("/api/admin/ai").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn embed_text_short_circuits_when_ai_is_disabled() {
+        let (state, _dir) = test_state();
+        state.ai_enabled.store(false, Ordering::Relaxed);
+        let result = embed_text(&state, "anything".into()).await;
+        assert!(result.is_none());
     }
 }
