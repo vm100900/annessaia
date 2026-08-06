@@ -246,7 +246,7 @@ enum WidgetCmd {
     Checkbox { id: i32, label: String, checked: bool },
     Slider   { id: i32, label: String, min: f32, max: f32, value: f32 },
     Progress { value: f32, label: String },
-    TextEdit { id: i32, hint: String },
+    TextEdit { id: i32, hint: String, secret: bool },
     Text { s: String, size: f32, color: Color32 },
     Badge { s: String, color: Color32 },
     RowBegin, RowEnd,
@@ -412,12 +412,13 @@ fn render_widgets(
             }
 
             // ── Text input ────────────────────────────────────────────────────
-            WidgetCmd::TextEdit { id, hint } => {
+            WidgetCmd::TextEdit { id, hint, secret } => {
                 let entry = text_states.entry(*id).or_default();
                 let resp = ui.add(
                     egui::TextEdit::singleline(entry)
                         .hint_text(hint.as_str())
                         .desired_width(f32::INFINITY)
+                        .password(*secret)
                 );
                 if resp.changed() { upd.texts.push((*id, entry.clone())); }
             }
@@ -949,7 +950,15 @@ fn make_linker(engine: &Engine) -> anyhow::Result<Linker<HostState>> {
     l.func_wrap("env", "ui_text_edit", |mut c: Caller<'_, HostState>, id: i32, hp: i32, hl: i32, op: i32, om: i32| -> i32 {
         let hint = read_str(&mut c, hp, hl);
         let text = c.data().text_states.get(&id).cloned().unwrap_or_default();
-        c.data_mut().widget_cmds.push(WidgetCmd::TextEdit { id, hint });
+        c.data_mut().widget_cmds.push(WidgetCmd::TextEdit { id, hint, secret: false });
+        write_bytes(&mut c, op, om, text.as_bytes())
+    })?;
+    // Masked variant of ui_text_edit — identical contract, but the host draws
+    // entered characters as dots. Used for password fields.
+    l.func_wrap("env", "ui_text_edit_secret", |mut c: Caller<'_, HostState>, id: i32, hp: i32, hl: i32, op: i32, om: i32| -> i32 {
+        let hint = read_str(&mut c, hp, hl);
+        let text = c.data().text_states.get(&id).cloned().unwrap_or_default();
+        c.data_mut().widget_cmds.push(WidgetCmd::TextEdit { id, hint, secret: true });
         write_bytes(&mut c, op, om, text.as_bytes())
     })?;
 

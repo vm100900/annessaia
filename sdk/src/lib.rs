@@ -59,6 +59,7 @@ mod raw {
         pub fn ui_progress_text(value: f32, ptr: *const u8, len: usize);
         /// Text input. Returns bytes of current text written to out_ptr.
         pub fn ui_text_edit(id: i32, hp: *const u8, hl: usize, op: *mut u8, om: usize) -> i32;
+        pub fn ui_text_edit_secret(id: i32, hp: *const u8, hl: usize, op: *mut u8, om: usize) -> i32;
 
         // Widget UI — text/badge
         pub fn ui_text(ptr: *const u8, len: usize, size: f32, color: i32);
@@ -990,6 +991,20 @@ pub mod widget {
     pub fn text_field(id: i32, hint: &str) -> String {
         let mut buf = vec![0u8; 4096];
         let n = unsafe { raw::ui_text_edit(id, hint.as_ptr(), hint.len(), buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 { return String::new(); }
+        String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+    }
+
+    /// Same as [`text_field`], but the host masks entered characters — for
+    /// password/secret entry.
+    ///
+    /// ```rust,no_run
+    /// # use annessaia_sdk::prelude::*;
+    /// let password = text_field_secret(0, "Password…");
+    /// ```
+    pub fn text_field_secret(id: i32, hint: &str) -> String {
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe { raw::ui_text_edit_secret(id, hint.as_ptr(), hint.len(), buf.as_mut_ptr(), buf.len()) };
         if n <= 0 { return String::new(); }
         String::from_utf8_lossy(&buf[..n as usize]).into_owned()
     }
