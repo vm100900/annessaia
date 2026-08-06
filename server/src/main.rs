@@ -23,9 +23,10 @@
 use axum::{
     Router,
     body::Bytes,
-    extract::{Query, State, WebSocketUpgrade},
+    extract::{Query, State, WebSocketUpgrade, Request},
     extract::ws::{Message as AxMsg, WebSocket},
-    response::{IntoResponse, Redirect},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use futures::{SinkExt, StreamExt};
@@ -1549,28 +1550,36 @@ async fn heartbeat(state: St) {
     }
 }
 
+// Auth gate for every admin-only route (see build_router). Checks a
+// `?token=` query parameter against the in-memory session set — not a
+// header or cookie, because the WASM host's net::get/net::post only support
+// a URL and a body (see Global Constraints in the design doc). Always
+// answers with HTTP 200: on rejection the body is the bare sentinel
+// "unauthorized", distinct from the ok\t/err\t convention used elsewhere, so
+// admin.wasm can tell "not logged in" apart from an ordinary error.
+async fn require_admin(
+    State(st): State<St>,
+    Query(q): Query<HashMap<String, String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let token = q.get("token").cloned().unwrap_or_default();
+    if !token.is_empty() && st.admin_sessions.lock().unwrap().contains(&token) {
+        next.run(req).await
+    } else {
+        "unauthorized".into_response()
+    }
+}
+
 // Every route this node serves. A plain function (not inlined in `main`) so
 // tests can build the exact same router against a throwaway AppState instead
 // of a partial hand-rolled copy that could drift from what actually runs.
-//
-// Tasks 4 and 5 will move some of these routes into an auth-gated group and
-// add the AI-toggle route; for now this is a straight lift of the router
-// `main` already built, unchanged in behavior.
 fn build_router(state: St, data_dir: &Path) -> Router {
-    Router::new()
-        .route("/",                  get(serve_index))
-        .route("/admin",             get(serve_admin))
-        .route("/ws",                get(ws_endpoint))
-        .route("/api/apps",          get(api_apps))
-        .route("/api/search",        get(api_search))
-        .route("/api/search/debug",  get(api_search_debug))
-        .route("/api/submit",        post(api_submit))
-        .route("/api/upload",        post(api_upload))
+    // Everything reachable only from admin.wasm today (revoke, peer
+    // management, directory publish/unpublish/refresh) plus the AI toggle
+    // added in Task 5 — closing the open-access gap this feature exists for.
+    let admin_routes = Router::new()
         .route("/api/mine",          get(api_mine))
-        .route("/api/stats",         get(api_stats))
-        .route("/api/reviews",       get(api_reviews))
-        .route("/api/rate",          post(api_rate))
-        .route("/api/open",          post(api_open))
         .route("/api/peers",         get(api_peers))
         .route("/api/peers/active",  get(api_active_peers))
         .route("/api/revoke",        post(api_revoke))
@@ -1580,9 +1589,25 @@ fn build_router(state: St, data_dir: &Path) -> Router {
         .route("/api/directory/publish",     post(api_directory_publish))
         .route("/api/directory/unpublish",   post(api_directory_unpublish))
         .route("/api/directory/refresh",     post(api_directory_refresh))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
+    Router::new()
+        .route("/",                  get(serve_index))
+        .route("/admin",             get(serve_admin))
+        .route("/ws",                get(ws_endpoint))
+        .route("/api/apps",          get(api_apps))
+        .route("/api/search",        get(api_search))
+        .route("/api/search/debug",  get(api_search_debug))
+        .route("/api/submit",        post(api_submit))
+        .route("/api/upload",        post(api_upload))
+        .route("/api/stats",         get(api_stats))
+        .route("/api/reviews",       get(api_reviews))
+        .route("/api/rate",          post(api_rate))
+        .route("/api/open",          post(api_open))
         .route("/api/admin/status",  get(api_admin_status))
         .route("/api/admin/setup",   post(api_admin_setup))
         .route("/api/admin/login",   post(api_admin_login))
+        .merge(admin_routes)
         // Apps uploaded through /api/upload, served straight back out.
         .nest_service("/apps", ServeDir::new(data_dir.join("apps")))
         .fallback_service(ServeDir::new("dist"))
@@ -1799,5 +1824,44 @@ mod tests {
 
         let resp = app.oneshot(Request::post("/api/admin/login").body(Body::from("wrong")).unwrap()).await.unwrap();
         assert_eq!(body_str(resp).await, "err\twrong password");
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_a_missing_token() {
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+        let resp = app.oneshot(Request::get("/api/peers").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(body_str(resp).await, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_an_unknown_token() {
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+        let resp = app.oneshot(Request::get("/api/peers?token=not-a-real-session").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_str(resp).await, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn admin_routes_accept_a_valid_session_token() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+        let resp = app.clone().oneshot(Request::post("/api/admin/setup").body(Body::from("hunter2pass")).unwrap()).await.unwrap();
+        let token = body_str(resp).await.strip_prefix("ok\t").unwrap().to_string();
+
+        let resp = app.oneshot(Request::get(&format!("/api/peers?token={token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        // No peers yet, but the request got through: empty, not "unauthorized".
+        assert_eq!(body_str(resp).await, "");
+    }
+
+    #[tokio::test]
+    async fn public_routes_do_not_require_a_token() {
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+        let resp = app.oneshot(Request::get("/api/apps").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_ne!(body_str(resp).await, "unauthorized");
     }
 }
