@@ -32,8 +32,11 @@ use futures::{SinkExt, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message as TMsg;
@@ -636,17 +639,28 @@ fn read_lines(path: &PathBuf) -> Vec<String> {
 
 // Secret generated once per node. The directory stores it alongside our listing so
 // nobody else can refresh or delete that entry. Never leaves the data dir.
+// 32 random lowercase-hex characters — used for a node's own identity token
+// (persisted, see load_or_make_token) and for admin session tokens
+// (in-memory only, see AppState::admin_sessions).
+fn random_hex(len: usize) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..len).map(|_| char::from_digit(rng.gen_range(0..16), 16).unwrap()).collect()
+}
+
 fn load_or_make_token(data_dir: &PathBuf) -> String {
     let path = data_dir.join("token.txt");
     let existing = fs::read_to_string(&path).unwrap_or_default().trim().to_string();
     if !existing.is_empty() { return existing; }
-
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let token: String = (0..32).map(|_| char::from_digit(rng.gen_range(0..16), 16).unwrap()).collect();
+    let token = random_hex(32);
     fs::write(&path, &token).ok();
     token
 }
+
+// Where the admin password hash and the AI on/off flag live on disk —
+// alongside token.txt/peers.txt, same data_dir.
+fn admin_pass_path(data_dir: &Path) -> PathBuf { data_dir.join("admin_pass.hash") }
+fn ai_enabled_path(data_dir: &Path)  -> PathBuf { data_dir.join("ai_enabled") }
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -663,6 +677,13 @@ struct AppState {
     // rather than restructured just to silence it.
     #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     embedder: Mutex<Option<Embedder>>,
+    // Admin session tokens issued by /api/admin/setup and /api/admin/login.
+    // In-memory only — a server restart is the only logout there is.
+    admin_sessions: Mutex<HashSet<String>>,
+    // Server-wide AI on/off switch. Settable only through the authenticated
+    // /api/admin/ai endpoint (Task 5); read by embed_text before it touches
+    // the embedder at all. Persisted to ai_enabled_path(data_dir).
+    ai_enabled: AtomicBool,
 }
 
 type St = Arc<AppState>;
@@ -1509,11 +1530,17 @@ async fn main() {
     // after it loads and before AppState takes ownership of it.
     let registry = Registry::load(data_dir.clone(), self_url.clone(), &mut embedder);
 
+    let ai_enabled = fs::read_to_string(ai_enabled_path(&data_dir))
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true);
+
     let state: St = Arc::new(AppState {
         registry:   Mutex::new(registry),
         conns:      Mutex::new(HashMap::new()),
         connect_tx,
         embedder:   Mutex::new(embedder),
+        admin_sessions: Mutex::new(HashSet::new()),
+        ai_enabled: AtomicBool::new(ai_enabled),
     });
 
     // Connection manager: receives peer URLs from the channel and supervises an
@@ -1608,4 +1635,25 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_hex_has_requested_length_and_charset() {
+        let s = random_hex(32);
+        assert_eq!(s.len(), 32);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn random_hex_is_not_constant() {
+        // Not a proof of randomness — just a guard against a copy-paste bug
+        // that returns the same string every time.
+        let a = random_hex(32);
+        let b = random_hex(32);
+        assert_ne!(a, b);
+    }
 }
