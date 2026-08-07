@@ -36,6 +36,24 @@ static ACT_ID:    AtomicI32 = AtomicI32::new(-1);
 
 static VIEW: AtomicI32 = AtomicI32::new(0);   // 0 = apps, 1 = peers, 2 = directory
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+//
+// Session tokens live only in this WASM instance's memory (see init()) — a
+// fresh launch of admin.wasm always re-prompts for the password, even if the
+// server that granted the previous session is still running.
+
+static SESSION_TOKEN: Mutex<String> = Mutex::new(String::new());
+
+static STAGE: AtomicI32 = AtomicI32::new(STAGE_LOADING);
+const STAGE_LOADING:   i32 = 0;   // waiting on GET /api/admin/status
+const STAGE_SETUP:     i32 = 1;   // no admin password set yet
+const STAGE_LOGIN:     i32 = 2;   // password set, no valid session held
+const STAGE_DASHBOARD: i32 = 3;
+
+static STATUS_ID: AtomicI32 = AtomicI32::new(-1);
+static AUTH_ID:   AtomicI32 = AtomicI32::new(-1);   // setup/login request in flight
+static PASS_ERROR: Mutex<String> = Mutex::new(String::new());
+
 struct Entry { name: String, url: String, author: String }
 static APPS:   Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 // URLs this node published. Everything else arrived by gossip and belongs to
@@ -57,6 +75,7 @@ fn flash(msg: &str) { *FLASH.lock().unwrap() = msg.to_string(); }
 // ── Requests ──────────────────────────────────────────────────────────────────
 
 fn refresh() {
+    let token = SESSION_TOKEN.lock().unwrap().clone();
     for (slot, path) in [
         (&APPS_ID,   "/api/apps"),
         (&MINE_ID,   "/api/mine"),
@@ -66,7 +85,7 @@ fn refresh() {
     ] {
         let id = next_id();
         slot.store(id, Relaxed);
-        net::get(id, &format!("{SERVER}{path}"));
+        net::get(id, &format!("{SERVER}{path}?token={token}"));
     }
 }
 
@@ -75,7 +94,8 @@ fn action(path: &str, body: &str) {
     let id = next_id();
     ACT_ID.store(id, Relaxed);
     flash("Working…");
-    net::post(id, &format!("{SERVER}{path}"), body);
+    let token = SESSION_TOKEN.lock().unwrap().clone();
+    net::post(id, &format!("{SERVER}{path}?token={token}"), body);
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
@@ -110,21 +130,25 @@ fn poll_all() {
     });
 
     poll_into(&MINE_ID, |body| {
+        if handle_unauthorized(&body) { return; }
         *MINE.lock().unwrap() =
             body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     });
 
     poll_into(&PEERS_ID, |body| {
+        if handle_unauthorized(&body) { return; }
         *PEERS.lock().unwrap() =
             body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     });
 
     poll_into(&ACTIVE_ID, |body| {
+        if handle_unauthorized(&body) { return; }
         *ACTIVE.lock().unwrap() =
             body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     });
 
     poll_into(&DIR_ID, |body| {
+        if handle_unauthorized(&body) { return; }
         let line = body.lines().next().unwrap_or("");
         let mut p = line.splitn(3, '\t');
         let mut d = DIR.lock().unwrap();
@@ -150,6 +174,7 @@ fn poll_action() {
         }
         PollStr::Done(body) => {
             ACT_ID.store(-1, Relaxed);
+            if handle_unauthorized(&body) { return; }
             let line = body.lines().next().unwrap_or("").to_string();
             match line.split_once('\t') {
                 Some(("err", msg)) => flash(msg),
@@ -166,10 +191,81 @@ fn busy() -> bool { ACT_ID.load(Relaxed) >= 0 }
 // ── Entry points ──────────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn init() { refresh(); }
+pub extern "C" fn init() {
+    // Deliberately not restored from disk: the session lives only in this
+    // WASM instance's memory, so every fresh launch of admin.wasm asks for
+    // the password again, even if the server is still running from a
+    // previous session.
+    let id = next_id();
+    STATUS_ID.store(id, Relaxed);
+    net::get(id, &format!("{SERVER}/api/admin/status"));
+}
+
+// True if `body` is the auth middleware's rejection sentinel (see
+// server/src/main.rs require_admin) — resets the held session and sends the
+// user back to the login screen. Checked first by every poller that hits a
+// token-gated endpoint: a stale token (e.g. after the server restarted) must
+// not be handed to that poller's own parser as if it were real data.
+fn handle_unauthorized(body: &str) -> bool {
+    if body.trim() != "unauthorized" { return false; }
+    *SESSION_TOKEN.lock().unwrap() = String::new();
+    STAGE.store(STAGE_LOGIN, Relaxed);
+    flash("Session expired — please log in again.");
+    true
+}
+
+fn poll_status() {
+    let id = STATUS_ID.load(Relaxed);
+    if id < 0 { return; }
+    match net::poll_result_str(id) {
+        PollStr::Pending => {}
+        PollStr::Failed => {
+            STATUS_ID.store(-1, Relaxed);
+            flash("Cannot reach the server. Is it running?");
+        }
+        PollStr::Done(body) => {
+            STATUS_ID.store(-1, Relaxed);
+            STAGE.store(if body.trim() == "1" { STAGE_LOGIN } else { STAGE_SETUP }, Relaxed);
+        }
+    }
+}
+
+fn poll_auth() {
+    let id = AUTH_ID.load(Relaxed);
+    if id < 0 { return; }
+    match net::poll_result_str(id) {
+        PollStr::Pending => {}
+        PollStr::Failed => {
+            AUTH_ID.store(-1, Relaxed);
+            *PASS_ERROR.lock().unwrap() = "Cannot reach the server. Is it running?".to_string();
+        }
+        PollStr::Done(body) => {
+            AUTH_ID.store(-1, Relaxed);
+            match body.split_once('\t') {
+                Some(("ok", token)) => {
+                    *SESSION_TOKEN.lock().unwrap() = token.to_string();
+                    *PASS_ERROR.lock().unwrap() = String::new();
+                    STAGE.store(STAGE_DASHBOARD, Relaxed);
+                }
+                Some(("err", msg)) => *PASS_ERROR.lock().unwrap() = msg.to_string(),
+                _ => *PASS_ERROR.lock().unwrap() = "Unexpected response from server.".to_string(),
+            }
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn render() {
+    poll_status();
+    poll_auth();
+
+    match STAGE.load(Relaxed) {
+        STAGE_LOADING => { label("Checking server…"); return; }
+        STAGE_SETUP   => { setup_screen(); return; }
+        STAGE_LOGIN   => { login_screen(); return; }
+        _ => {}
+    }
+
     poll_all();
 
     row(|| {
@@ -215,6 +311,70 @@ fn tab(title: &str, index: i32, current: i32) {
     } else if button_ghost(title) {
         VIEW.store(index, Relaxed);
     }
+}
+
+fn password_form(
+    title: &str,
+    hint1: &str,
+    hint2: Option<&str>,
+    submit_label: &str,
+    on_submit: fn(String),
+) {
+    space(120.0);
+    card(|| {
+        text(title, 20.0, Color::WHITE);
+        space(6.0);
+        small("This protects everything on this page — revoking apps, managing peers,");
+        small("publishing to the directory, and the AI toggle. There is no reset button,");
+        small("so don't lose it.");
+        space(12.0);
+        let pass = text_field_secret(2, hint1);
+        let confirm = hint2.map(|h| { space(6.0); text_field_secret(3, h) });
+        space(10.0);
+        let error = PASS_ERROR.lock().unwrap().clone();
+        if !error.is_empty() { colored(&error, RED); space(8.0); }
+        let busy = AUTH_ID.load(Relaxed) >= 0;
+        if busy {
+            badge("WORKING…", MUTED);
+        } else if button_success(submit_label) {
+            if pass.len() < 8 {
+                *PASS_ERROR.lock().unwrap() = "Password must be at least 8 characters.".to_string();
+            } else if confirm.as_ref().is_some_and(|c| c != &pass) {
+                *PASS_ERROR.lock().unwrap() = "Passwords don't match.".to_string();
+            } else {
+                *PASS_ERROR.lock().unwrap() = String::new();
+                on_submit(pass);
+            }
+        }
+    });
+}
+
+fn setup_screen() {
+    password_form(
+        "Create an admin password",
+        "Password (at least 8 characters)",
+        Some("Confirm password"),
+        "  Create password  ",
+        |pass| {
+            let id = next_id();
+            AUTH_ID.store(id, Relaxed);
+            net::post(id, &format!("{SERVER}/api/admin/setup"), &pass);
+        },
+    );
+}
+
+fn login_screen() {
+    password_form(
+        "Admin login",
+        "Password",
+        None,
+        "  Log in  ",
+        |pass| {
+            let id = next_id();
+            AUTH_ID.store(id, Relaxed);
+            net::post(id, &format!("{SERVER}/api/admin/login"), &pass);
+        },
+    );
 }
 
 // ── Apps ──────────────────────────────────────────────────────────────────────
