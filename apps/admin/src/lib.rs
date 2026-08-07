@@ -68,6 +68,9 @@ static DIR: Mutex<Dir> = Mutex::new(Dir {
     url: String::new(), published: false, self_url: String::new(), loaded: false,
 });
 
+static AI_ID: AtomicI32 = AtomicI32::new(-1);
+static AI_ON: Mutex<Option<bool>> = Mutex::new(None);   // None until first loaded
+
 fn next_id() -> i32 { REQ.fetch_add(1, Relaxed) }
 
 fn flash(msg: &str) { *FLASH.lock().unwrap() = msg.to_string(); }
@@ -82,6 +85,7 @@ fn refresh() {
         (&PEERS_ID,  "/api/peers"),
         (&ACTIVE_ID, "/api/peers/active"),
         (&DIR_ID,    "/api/directory"),
+        (&AI_ID,     "/api/admin/ai"),
     ] {
         let id = next_id();
         slot.store(id, Relaxed);
@@ -156,6 +160,11 @@ fn poll_all() {
         d.published = p.next().unwrap_or("false") == "true";
         d.self_url  = p.next().unwrap_or("").to_string();
         d.loaded    = true;
+    });
+
+    poll_into(&AI_ID, |body| {
+        if handle_unauthorized(&body) { return; }
+        *AI_ON.lock().unwrap() = Some(body.trim() == "1");
     });
 
     poll_action();
@@ -283,6 +292,8 @@ pub extern "C" fn render() {
         tab("  Directory  ", 2, view);
         space(12.0);
         if button_ghost(" ⟳ Refresh ") { refresh(); }
+        space(12.0);
+        ai_toggle();
     });
 
     let msg = FLASH.lock().unwrap().clone();
@@ -310,6 +321,21 @@ fn tab(title: &str, index: i32, current: i32) {
         button_styled(title, Color::WHITE, BLUE, BLUE);
     } else if button_ghost(title) {
         VIEW.store(index, Relaxed);
+    }
+}
+
+// Server-wide switch: applies to every user of this node, not just the
+// admin viewing this panel. Nothing renders until the first /api/admin/ai
+// poll resolves, same as the directory tab's "Loading…" gate.
+fn ai_toggle() {
+    let on = *AI_ON.lock().unwrap();
+    let Some(on) = on else { return; };
+    if on {
+        if button_styled(" AI on server: ON ", Color::WHITE, Color::rgb(20, 83, 45), GREEN) {
+            action("/api/admin/ai", "0");
+        }
+    } else if button_ghost(" AI on server: OFF ") {
+        action("/api/admin/ai", "1");
     }
 }
 
