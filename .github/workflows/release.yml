@@ -42,8 +42,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13     # Intel
-            name: macos-x86_64
+          # Intel Mac (macos-13) deliberately left out: GitHub's hosted
+          # runner pool for that label has been slow/backed up to the point
+          # of jobs sitting queued indefinitely with no runner assigned —
+          # not worth the wait for a shrinking share of users, especially
+          # since Apple Silicon binaries still run on Intel via Rosetta.
           - os: macos-14     # Apple Silicon
             name: macos-arm64
           - os: ubuntu-latest
