@@ -131,7 +131,7 @@ static ERR: Mutex<String> = Mutex::new(String::new());
 fn next_id() -> i32 { REQ_CTR.fetch_add(1, Relaxed) }
 
 fn pick_wasm() {
-    if let Some((name, bytes)) = sys::pick_file("wasm") {
+    if let Some((name, bytes)) = sys::pick_file("wasm,wasmpackage,wasmh") {
         *PICKED.lock().unwrap() = Some((name, bytes));
         HOSTED_URL.lock().unwrap().clear();
         ERR.lock().unwrap().clear();
@@ -766,7 +766,7 @@ fn submit_tab() {
                     if button_ghost(" Choose a different file ") { pick_wasm(); }
                 }
                 None => {
-                    if button("  Choose a .wasm file…  ") { pick_wasm(); }
+                    if button("  Choose a .wasm, .wasmpackage, or .wasmh file…  ") { pick_wasm(); }
                     space(4.0);
                     small("The node will host it and fill in the URL for you.");
                 }

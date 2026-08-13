@@ -1282,8 +1282,18 @@ async fn api_upload(State(st): State<St>, Query(q): Query<HashMap<String, String
 
     if body.len() > 32 * 1024 * 1024 { return err("file is larger than 32 MB"); }
     // Reject anything that isn't actually WebAssembly, so the index cannot end up
-    // pointing at files the runtime will refuse to load.
-    if body.len() < 8 || &body[..4] != b"\0asm" { return err("that is not a .wasm file"); }
+    // pointing at files the runtime will refuse to load. A .wasmpackage (a zip of
+    // app.wasm + assets/) is accepted too — same content-based check the desktop
+    // host uses (is_zip in annessaia/src/main.rs) rather than trusting the
+    // filename, since the runtime itself never trusts the extension either.
+    // A .wasmh needs no special handling here: it's just one of the above with a
+    // 32-byte SHA-256 trailer *appended*, so the magic bytes at the start of the
+    // body are unaffected — the host strips that trailer itself on load
+    // (strip_hash_trailer in annessaia/src/main.rs), the same as it would for
+    // any other content-addressed fetch.
+    let is_wasm = body.len() >= 8 && &body[..4] == b"\0asm";
+    let is_zip  = body.len() >= 4 && body[..4] == [0x50, 0x4B, 0x03, 0x04];
+    if !is_wasm && !is_zip { return err("that is not a .wasm or .wasmpackage file"); }
 
     let (dir, self_url) = {
         let r = st.registry.lock().unwrap();
@@ -1922,5 +1932,52 @@ mod tests {
         state.ai_enabled.store(false, Ordering::Relaxed);
         let result = embed_text(&state, "anything".into()).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_both_bare_wasm_and_wasmpackage_zips() {
+        let (state, dir) = test_state();
+        let app = build_router(Arc::clone(&state), dir.path());
+
+        let mut wasm_body = b"\0asm".to_vec();
+        wasm_body.extend_from_slice(&[0u8; 8]);
+        let resp = app.clone()
+            .oneshot(Request::post("/api/upload?name=my-app").body(Body::from(wasm_body)).unwrap())
+            .await.unwrap();
+        assert!(body_str(resp).await.starts_with("ok\t"));
+
+        // .wasmpackage is a zip of app.wasm + assets/ — starts with the zip
+        // local-file-header signature, not the wasm magic bytes. Regression
+        // test for the bug where this was rejected outright.
+        let mut zip_body = vec![0x50, 0x4B, 0x03, 0x04];
+        zip_body.extend_from_slice(&[0u8; 8]);
+        let resp = app.clone()
+            .oneshot(Request::post("/api/upload?name=my-package").body(Body::from(zip_body)).unwrap())
+            .await.unwrap();
+        assert!(body_str(resp).await.starts_with("ok\t"));
+
+        let resp = app
+            .oneshot(Request::post("/api/upload?name=garbage").body(Body::from(vec![1, 2, 3, 4])).unwrap())
+            .await.unwrap();
+        assert_eq!(body_str(resp).await, "err\tthat is not a .wasm or .wasmpackage file");
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_a_wasmh_hash_trailer_without_choking_on_it() {
+        // .wasmh is real wasm content with a 32-byte hash appended at the end —
+        // the magic bytes stay at the start, so upload doesn't need to know
+        // anything about the trailer format at all (only the desktop host, on
+        // load, strips it). The trailer content itself doesn't need to be a
+        // real hash for this test: upload never inspects it.
+        let (state, dir) = test_state();
+        let app = build_router(state, dir.path());
+
+        let mut body = b"\0asm".to_vec();
+        body.extend_from_slice(&[0u8; 8]);
+        body.extend_from_slice(&[0xAB; 32]);
+        let resp = app
+            .oneshot(Request::post("/api/upload?name=my-app-wasmh").body(Body::from(body)).unwrap())
+            .await.unwrap();
+        assert!(body_str(resp).await.starts_with("ok\t"));
     }
 }
