@@ -1,0 +1,112 @@
+name: Release binaries
+
+# Builds annessaia + annessaia-server + the bundled example apps (dist/) for
+# macOS (Intel and Apple Silicon), Linux, and Windows.
+#
+#   - Push a tag like v0.1.0  -> builds all platforms and attaches the
+#     archives to a GitHub Release for that tag.
+#   - "Run workflow" (manual) -> builds all platforms as downloadable
+#     artifacts on the run page, without creating a release. Good for
+#     testing the workflow itself before cutting a real tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to create the release and upload assets
+
+jobs:
+  # Runs once, before the matrix, so four parallel jobs can't race each
+  # other trying to create the same release.
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
+
+  build:
+    needs: create-release
+    # Runs even when create-release was skipped (manual dispatch) — only
+    # actually blocked if create-release ran and failed.
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13     # Intel
+            name: macos-x86_64
+          - os: macos-14     # Apple Silicon
+            name: macos-arm64
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux system dependencies (GTK file dialogs, ALSA audio, X11/Wayland windowing)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libasound2-dev libx11-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Build WASM example apps into dist/
+        shell: bash
+        run: ./build.sh
+
+      - name: Build annessaia + annessaia-server (release)
+        run: cargo build --release -p annessaia -p annessaia-server
+
+      - name: Stage the archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="annessaia-${{ matrix.name }}"
+          mkdir -p "$stage"
+          cp README.md "$stage/"
+          cp -r dist "$stage/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/annessaia.exe "$stage/"
+            cp target/release/annessaia-server.exe "$stage/"
+          else
+            cp target/release/annessaia "$stage/"
+            cp target/release/annessaia-server "$stage/"
+          fi
+
+      - name: Archive (zip)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path 'annessaia-${{ matrix.name }}' -DestinationPath 'annessaia-${{ matrix.name }}.zip'"
+          else
+            zip -r "annessaia-${{ matrix.name }}.zip" "annessaia-${{ matrix.name }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: annessaia-${{ matrix.name }}
+          path: annessaia-${{ matrix.name }}.zip
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" "annessaia-${{ matrix.name }}.zip" \
+            --repo "${{ github.repository }}" --clobber
