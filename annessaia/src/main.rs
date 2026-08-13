@@ -460,8 +460,13 @@ enum GpuCmd {
     Clear(Color32),
     Rect { x: f32, y: f32, w: f32, h: f32, rounding: f32, color: Color32 },
     Circle { cx: f32, cy: f32, r: f32, color: Color32 },
+    CircleStroke { cx: f32, cy: f32, r: f32, color: Color32, thickness: f32 },
     Line { x1: f32, y1: f32, x2: f32, y2: f32, color: Color32, thickness: f32 },
     Triangle { x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, color: Color32 },
+    // Horizontally centered on (x, y): x is the center, y is the top —
+    // matches every call site in practice (titles, HUD labels, button
+    // captions), so the guest never has to measure text width itself.
+    Text { x: f32, y: f32, s: String, size: f32, color: Color32 },
     Image { id: i32, x: f32, y: f32, w: f32, h: f32 },
 }
 
@@ -473,6 +478,18 @@ fn paint_gpu(painter: &egui::Painter, origin: egui::Pos2, cmd: &GpuCmd, images: 
         }
         GpuCmd::Circle { cx, cy, r, color } => {
             painter.circle_filled(origin + egui::vec2(*cx,*cy), *r, *color);
+        }
+        GpuCmd::CircleStroke { cx, cy, r, color, thickness } => {
+            painter.circle_stroke(origin + egui::vec2(*cx,*cy), *r, Stroke::new(*thickness, *color));
+        }
+        GpuCmd::Text { x, y, s, size, color } => {
+            painter.text(
+                origin + egui::vec2(*x,*y),
+                egui::Align2::CENTER_TOP,
+                s,
+                egui::FontId::proportional(*size),
+                *color,
+            );
         }
         GpuCmd::Line { x1, y1, x2, y2, color, thickness } => {
             painter.line_segment([origin+egui::vec2(*x1,*y1), origin+egui::vec2(*x2,*y2)], Stroke::new(*thickness,*color));
@@ -1008,11 +1025,20 @@ fn make_linker(engine: &Engine) -> anyhow::Result<Linker<HostState>> {
     l.func_wrap("env", "gpu_circle", |mut c: Caller<'_, HostState>, cx:f32,cy:f32,r:f32,color:i32| {
         c.data_mut().gpu_cmds.push(GpuCmd::Circle{cx,cy,r,color:unpack(color)});
     })?;
+    l.func_wrap("env", "gpu_circle_stroke", |mut c: Caller<'_, HostState>, cx:f32,cy:f32,r:f32,color:i32,thickness:f32| {
+        c.data_mut().gpu_cmds.push(GpuCmd::CircleStroke{cx,cy,r,color:unpack(color),thickness});
+    })?;
     l.func_wrap("env", "gpu_line", |mut c: Caller<'_, HostState>, x1:f32,y1:f32,x2:f32,y2:f32,color:i32,thickness:f32| {
         c.data_mut().gpu_cmds.push(GpuCmd::Line{x1,y1,x2,y2,color:unpack(color),thickness});
     })?;
     l.func_wrap("env", "gpu_triangle", |mut c: Caller<'_, HostState>, x1:f32,y1:f32,x2:f32,y2:f32,x3:f32,y3:f32,color:i32| {
         c.data_mut().gpu_cmds.push(GpuCmd::Triangle{x1,y1,x2,y2,x3,y3,color:unpack(color)});
+    })?;
+    // Horizontally centered on x; y is the top of the text, matching the
+    // gpu::text SDK wrapper's contract.
+    l.func_wrap("env", "gpu_text", |mut c: Caller<'_, HostState>, x:f32,y:f32,ptr:i32,len:i32,size:f32,color:i32| {
+        let s = read_str(&mut c, ptr, len);
+        c.data_mut().gpu_cmds.push(GpuCmd::Text{x,y,s,size,color:unpack(color)});
     })?;
 
     // ── Canvas / time ─────────────────────────────────────────────────────────

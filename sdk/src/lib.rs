@@ -37,8 +37,10 @@ mod raw {
         pub fn gpu_clear(color: i32);
         pub fn gpu_rect(x: f32, y: f32, w: f32, h: f32, rounding: f32, color: i32);
         pub fn gpu_circle(cx: f32, cy: f32, r: f32, color: i32);
+        pub fn gpu_circle_stroke(cx: f32, cy: f32, r: f32, color: i32, thickness: f32);
         pub fn gpu_line(x1: f32, y1: f32, x2: f32, y2: f32, color: i32, thickness: f32);
         pub fn gpu_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, color: i32);
+        pub fn gpu_text(x: f32, y: f32, ptr: *const u8, len: usize, size: f32, color: i32);
 
         // Widget UI — text
         pub fn ui_heading(ptr: *const u8, len: usize);
@@ -286,6 +288,18 @@ pub mod gpu {
     /// Filled circle.
     #[inline] pub fn circle(cx: f32, cy: f32, r: f32, color: Color) {
         unsafe { raw::gpu_circle(cx, cy, r, color.0) }
+    }
+
+    /// Outlined (unfilled) circle.
+    #[inline] pub fn circle_stroke(cx: f32, cy: f32, r: f32, color: Color, thickness: f32) {
+        unsafe { raw::gpu_circle_stroke(cx, cy, r, color.0, thickness) }
+    }
+
+    /// Horizontally centered text — `x` is the center, `y` is the top. No
+    /// word-wrap: the host draws it as one line, so keep strings short
+    /// enough to fit the canvas width at the given `size`.
+    #[inline] pub fn text(x: f32, y: f32, s: &str, size: f32, color: Color) {
+        unsafe { raw::gpu_text(x, y, s.as_ptr(), s.len(), size, color.0) }
     }
 
     /// Stroked line.
