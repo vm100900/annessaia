@@ -128,3 +128,4 @@ tools/annessaia    CLI: scaffold a new app, build a .wasm/.wasmh
 directory/         the public bootstrap directory (Cloudflare Worker), for
                    nodes to discover their first peer
 ```
+[![Watch the annessaia demo video](https://www.youtube.com/watch?v=zuyo0zPQWVI)](https://www.youtube.com/watch?v=zuyo0zPQWVI)
